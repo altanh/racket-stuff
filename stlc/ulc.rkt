@@ -4,11 +4,9 @@
 ; https://en.wikipedia.org/wiki/Lambda_calculus
 ; https://en.wikipedia.org/wiki/De_Bruijn_index
 ; https://www.cs.cornell.edu/courses/cs4110/2018fa/lectures/lecture15.pdf
+; https://www.cs.tufts.edu/comp/105-2019f/reduction.pdf
 ;
 ; Definitely an exercise in irony since I'm doing this in Racket
-;
-; TODOs
-;   - explore different reduction strategy, fact(3) takes a long time currently
 
 #lang racket
 
@@ -79,17 +77,14 @@
        (define sym-idx (index-of bindings sym))
        (cond
          [sym-idx (+ sym-idx 1)]
-         [else
-          (unless (hash-has-key? context sym)
-            (hash-set! context sym (+ (hash-count context) 1)))
-          (+ (hash-ref context sym) (length bindings))])]
+         [else (+ (hash-ref context sym) (length bindings))])]
       [(struct abs (v body))
        (define sym (var-sym v))
        (db-abs (to-db-rec body (cons sym bindings)))]
       [(struct app (func arg))
        (app (to-db-rec func bindings)
             (to-db-rec arg bindings))]
-      [t t]))
+      [t (raise t)]))
   (to-db-rec term empty))
 
 (define (substitute-db term fvn target)
@@ -103,17 +98,64 @@
     [(struct app (func arg))
      (app (substitute-db func fvn target)
           (substitute-db arg fvn target))]
-    [t t]))
+    [t (raise t)]))
 
-(define (β-reduce-db term)
+(define (rule-β-db term reducer)
+  (match term
+    [(struct app ((struct db-abs (body)) arg))
+     (↑ (substitute-db body 1 (↑ arg 1 1)) -1 1)]
+    [_ #f]))
+
+(define (rule-μ-db term reducer)
+  (match term
+    [(struct app (func arg))
+     (define try-reduce-arg (reducer arg))
+     (and try-reduce-arg (app func try-reduce-arg))]
+    [_ #f]))
+
+(define (rule-nu-db term reducer)
+  (match term
+    [(struct app (func arg))
+     (define try-reduce-func (reducer func))
+     (and try-reduce-func (app try-reduce-func arg))]
+    [_ #f]))
+
+(define (rule-ξ-db term reducer)
   (match term
     [(struct db-abs (body))
-     (db-abs (β-reduce-db body))]
-    [(struct app (func arg))
-     (if (db-abs? func)
-         (↑ (substitute-db (db-abs-body func) 1 (↑ arg 1 1)) -1 1)
-         (app (β-reduce-db func) (β-reduce-db arg)))]
-    [t t]))
+     (define try-reduce-body (reducer body))
+     (and try-reduce-body (db-abs try-reduce-body))]
+    [_ #f]))
+
+; normal-order reduction strategy
+(define (normal-reducer-db term)
+  (match term
+    [(? db-abs? t)
+     (rule-ξ-db t normal-reducer-db)]
+    [(? integer? n) #f]
+    [(? app? t)
+     (or (rule-β-db t normal-reducer-db)
+         (rule-nu-db t normal-reducer-db)
+         (rule-μ-db t normal-reducer-db))]
+    [_ #f]))
+
+; (left-to-right) applicative-order reduction strategy
+(define (applicative-reducer-db term)
+  (match term
+    [(? db-abs? t)
+     (rule-ξ-db t applicative-reducer-db)]
+    [(? integer? n) #f]
+    [(? app? t)
+     (or (rule-μ-db t applicative-reducer-db)
+         (rule-nu-db t applicative-reducer-db)
+         (rule-β-db t applicative-reducer-db))]
+    [_ #f]))
+
+(define (reduce*-db term reducer)
+  (define try-reduce (reducer term))
+  (if try-reduce
+      (reduce*-db try-reduce reducer)
+      term))
 
 ; helper to make a mapping of free vars to indices, needed for de Bruijn conversion
 (define (make-db-context term)
@@ -127,13 +169,6 @@
   (for/fold ([result (app f (car args))])
             ([arg (rest args)])
     (app result arg)))
-
-; evaluator (repeatedly applies β-reduction until fixed point)
-(define (eval-db term)
-  (define reduced (β-reduce-db term))
-  (if (equal? reduced term)
-      reduced
-      (eval-db reduced)))
 
 ; combinators
 (define KC
@@ -210,10 +245,10 @@
 ; the compiler. context refers to symbols bound by λ, bindings refers to symbols bound by let/letrec
 (define (compile-rec program #:context context #:bindings bindings)
   (match program
-    [`(let ,sym ,val ,body)
+    [`(let ,sym = ,val in ,body)
      (define compiled-val (compile-rec val #:context context #:bindings bindings))
      (compile-rec body #:context context #:bindings (hash-set bindings sym compiled-val))]
-    [`(letrec ,sym (λ (,args ...) ,defn) ,body)
+    [`(letrec ,sym = (λ (,args ...) ,defn) in ,body)
      (define self-fun `(λ (,sym ,@args) ,defn))
      (define compiled-self-fun (compile-rec self-fun #:context context #:bindings bindings))
      (define compiled-rec-fun (app YC compiled-self-fun))
@@ -251,42 +286,77 @@
 (define (compile program)
   (compile-rec program #:context (make-immutable-hash) #:bindings (make-immutable-hash)))
 
-
 ;; tests
 
+(define (normal-reduce* term)
+  (reduce*-db term normal-reducer-db))
+
+(define (applicative-reduce* term)
+  (reduce*-db term applicative-reducer-db))
+
 (define def-add-2
-  `(let add-2 (λ (n) (+ n 2))
+  `(let add-2 = (λ (n) (+ n 2)) in
      (add-2 3)))
 
 (define letrec-fact
-  `(letrec fact
+  `(letrec fact =
      (λ (n) (ite (zero? n)
                  1
-                 (* n (fact (- n 1)))))
+                 (* n (fact (- n 1))))) in
      (fact 3)))
 
 (define letrec-simple
-  `(letrec simple
+  `(letrec simple =
      (λ (n) (* n (- n 1)))
-     (simple 4)))
+     in (simple 4)))
 
 (define ite-simple
-  `(let ite-simple
+  `(let ite-simple =
      (λ (n) (ite (zero? n)
                  n
-                 (- n 1)))
+                 (- n 1))) in
      (ite-simple 3)))
 
 (define zero-is-zero
   `(zero? 0))
 
-(unless (equal? (eval-db (compile def-add-2)) (eval-db (compile-nat 5)))
-  (raise "def-add-2 failed"))
-(unless (equal? (eval-db (compile letrec-fact)) (eval-db (compile-nat 6)))
-  (raise "letrec-fact failed"))
-(unless (equal? (eval-db (compile letrec-simple)) (eval-db (compile-nat 12)))
-  (raise "letrec-simple failed"))
-(unless (equal? (eval-db (compile ite-simple)) (eval-db (compile-nat 2)))
-  (raise "ite-simple failed"))
-(unless (equal? (eval-db (compile zero-is-zero)) TRUE)
-  (raise "zero-is-zero failed"))
+(define nested-let
+  `(let x = 2 in
+     (let y = 5 in
+       (* x y))))
+
+(define letrec-pow
+  `(letrec pow =
+     (λ (n m)
+       (ite (zero? m)
+            1
+            (* n (pow n (- m 1))))) in
+     (pow 4 2)))
+
+(define (run-test prog ret reduce* name strategy)
+  (define compiled (compile prog))
+  (define-values (res cpu real garbage) (time-apply reduce* (list compiled)))
+  (define normal-form (car res))
+  (if (equal? normal-form (reduce* ret))
+      (printf "~a: passed in ~a ms\n" name real)
+      (printf "~a: failed in ~a ms!!\n" name real)))
+
+(define (run-tests items reduce* strategy)
+  (printf "running tests using ~a strategy...\n" strategy)
+  (for ([item items])
+    (match item
+      [(list prog ret name)
+       (run-test prog ret reduce* name strategy)]
+      [_ (error "expected a test item of form (list prog ret name)")])))
+
+(define tests
+  (list
+   (list def-add-2 (compile-nat 5) "def-add-2")
+   (list letrec-fact (compile-nat 6) "letrec-fact")
+   (list letrec-simple (compile-nat 12) "letrec-simple")
+   (list ite-simple (compile-nat 2) "ite-simple")
+   (list zero-is-zero TRUE "zero-is-zero")
+   (list nested-let (compile-nat 10) "nested-let")
+   (list letrec-pow (compile-nat 16) "letrec-pow")))
+
+(run-tests tests normal-reduce* "normal-order reduction")
