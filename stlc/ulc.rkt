@@ -100,12 +100,27 @@
           (substitute-db arg fvn target))]
     [t (raise t)]))
 
+(define (free-vars-db term)
+  (match term
+    [(? integer? n)
+     (set n)]
+    [(struct db-abs (body))
+     (define unshifted (set-remove (free-vars-db body) 1))
+     (apply set (set-map unshifted (λ (n) (- n 1))))]
+    [(struct app (func arg))
+     (set-union (free-vars-db func) (free-vars-db arg))]))
+
+; -------------------- (β)
+; (λx.M)N -> M[x := N]
 (define (rule-β-db term reducer)
   (match term
     [(struct app ((struct db-abs (body)) arg))
      (↑ (substitute-db body 1 (↑ arg 1 1)) -1 1)]
     [_ #f]))
 
+;   a -> a'
+; ---------- (μ)
+; f a -> f a'
 (define (rule-μ-db term reducer)
   (match term
     [(struct app (func arg))
@@ -113,6 +128,9 @@
      (and try-reduce-arg (app func try-reduce-arg))]
     [_ #f]))
 
+;   f -> f'
+; ----------- (ν, nu)
+; f a -> f' a
 (define (rule-nu-db term reducer)
   (match term
     [(struct app (func arg))
@@ -120,6 +138,9 @@
      (and try-reduce-func (app try-reduce-func arg))]
     [_ #f]))
 
+;    M -> M'
+; ------------- (ξ)
+; λx.M -> λx.M'
 (define (rule-ξ-db term reducer)
   (match term
     [(struct db-abs (body))
@@ -127,28 +148,28 @@
      (and try-reduce-body (db-abs try-reduce-body))]
     [_ #f]))
 
+;   x ∉ FV(f)
+; ------------- (η)
+; λx.(f x) -> f
+(define (rule-η-db term reducer)
+  (match term
+    [(struct db-abs ((struct app (f 1))))
+     (if (set-member? (free-vars-db f) 1)
+         #f
+         f)]
+    [_ #f]))
+
 ; normal-order reduction strategy
 (define (normal-reducer-db term)
   (match term
     [(? db-abs? t)
-     (rule-ξ-db t normal-reducer-db)]
+     (or (rule-η-db t normal-reducer-db)
+         (rule-ξ-db t normal-reducer-db))]
     [(? integer? n) #f]
     [(? app? t)
      (or (rule-β-db t normal-reducer-db)
          (rule-nu-db t normal-reducer-db)
          (rule-μ-db t normal-reducer-db))]
-    [_ #f]))
-
-; (left-to-right) applicative-order reduction strategy
-(define (applicative-reducer-db term)
-  (match term
-    [(? db-abs? t)
-     (rule-ξ-db t applicative-reducer-db)]
-    [(? integer? n) #f]
-    [(? app? t)
-     (or (rule-μ-db t applicative-reducer-db)
-         (rule-nu-db t applicative-reducer-db)
-         (rule-β-db t applicative-reducer-db))]
     [_ #f]))
 
 (define (reduce*-db term reducer)
@@ -291,9 +312,6 @@
 (define (normal-reduce* term)
   (reduce*-db term normal-reducer-db))
 
-(define (applicative-reduce* term)
-  (reduce*-db term applicative-reducer-db))
-
 (define def-add-2
   `(let add-2 = (λ (n) (+ n 2)) in
      (add-2 3)))
@@ -303,7 +321,7 @@
      (λ (n) (ite (zero? n)
                  1
                  (* n (fact (- n 1))))) in
-     (fact 3)))
+     (fact 3)))  ; (fact 4) takes 20s compared to 2s for (fact 3) in normal-order
 
 (define letrec-simple
   `(letrec simple =
@@ -324,6 +342,11 @@
   `(let x = 2 in
      (let y = 5 in
        (* x y))))
+
+(define shadow-let
+  `(let x = 3 in
+     (let x = (+ x x) in
+       (cons x x))))
 
 (define letrec-pow
   `(letrec pow =
@@ -357,6 +380,7 @@
    (list ite-simple (compile-nat 2) "ite-simple")
    (list zero-is-zero TRUE "zero-is-zero")
    (list nested-let (compile-nat 10) "nested-let")
-   (list letrec-pow (compile-nat 16) "letrec-pow")))
+   (list letrec-pow (compile-nat 16) "letrec-pow")
+   (list shadow-let (compile `(cons 6 6)) "shadow-let")))
 
 (run-tests tests normal-reduce* "normal-order reduction")
